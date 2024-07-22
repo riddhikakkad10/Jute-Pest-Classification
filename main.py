@@ -1,118 +1,94 @@
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module='urllib3')
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50 # type: ignore
+from tensorflow.keras.preprocessing.image import ImageDataGenerator # type: ignore
+from tensorflow.keras.models import Model # type: ignore
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D # type: ignore
+from tensorflow.keras.optimizers import Adam # type: ignore
+from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint # type: ignore
 
-import os
-import cv2
-import numpy as np
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
-from tensorflow.keras.utils import to_categorical
+# Enable mixed precision training
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
-# Define the paths
-dataset_path = '/Users/riddhikakkad/Desktop/Jute_Pest_Dataset'
-augmented_path = '/Users/riddhikakkad/Desktop/Jute_Pest_Dataset_Augmented'
-os.makedirs(augmented_path, exist_ok=True)
+# Set image dimensions
+img_width, img_height = 224, 224  # Adjust to match ResNet50 input dimensions
 
-# Function to preprocess and resize the image
-def preprocess_and_resize_image(image_path):
-    # Read the image
-    img = cv2.imread(image_path)
-    
-    # Resize the image to 224x224
-    img_resized = cv2.resize(img, (224, 224))
-    
-    return img_resized
+# Paths to the dataset
+train_dir = '/Users/riddhikakkad/Desktop/Jute_Pest_Dataset/train'
+val_dir = '/Users/riddhikakkad/Desktop/Jute_Pest_Dataset/val'
+test_dir = '/Users/riddhikakkad/Desktop/Jute_Pest_Dataset/test'
 
-# Function to load and preprocess images from a directory
-def load_and_preprocess_images(directory):
-    images = []
-    labels = []
-    class_names = os.listdir(directory)
-    
-    for class_name in class_names:
-        class_dir = os.path.join(directory, class_name)
-        if not os.path.isdir(class_dir):
-            continue
-        
-        for img_name in os.listdir(class_dir):
-            img_path = os.path.join(class_dir, img_name)
-            if not os.path.isfile(img_path):
-                continue
-            
-            # Preprocess and resize the image
-            img_resized = preprocess_and_resize_image(img_path)
-            images.append(img_resized)
-            labels.append(class_name)
-    
-    return np.array(images), np.array(labels), class_names
-
-# Load and preprocess images
-train_images, train_labels, class_names = load_and_preprocess_images(os.path.join(dataset_path, 'train'))
-
-# ImageDataGenerator for augmentation
-datagen = ImageDataGenerator(
+# Data augmentation and preprocessing
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
     rotation_range=30,
     width_shift_range=0.2,
-    height_shift_range=0.2,
-    zoom_range=0.2,
-    vertical_flip=True,
-    horizontal_flip=True,
-    fill_mode='nearest'
+    height_shift_range=0.2
 )
 
-# Function to save augmented images
-def save_augmented_images(images, labels, class_names):
-    for i, (img, label) in enumerate(zip(images, labels)):
-        # Create directory for each class if it doesn't exist
-        class_dir = os.path.join(augmented_path, class_names[label])
-        os.makedirs(class_dir, exist_ok=True)
-        
-        # Reshape image for ImageDataGenerator
-        img = img.reshape((1,) + img.shape)
-        
-        # Generate 20 augmented images
-        j = 0
-        for batch in datagen.flow(img, batch_size=1, save_to_dir=class_dir, save_prefix='aug', save_format='jpg'):
-            j += 1
-            if j >= 20:
-                break
+val_datagen = ImageDataGenerator(rescale=1./255)
+test_datagen = ImageDataGenerator(rescale=1./255)
 
-# Convert string labels to integer indices
-label_to_index = {name: idx for idx, name in enumerate(class_names)}
-train_labels_idx = np.array([label_to_index[label] for label in train_labels])
+train_generator = train_datagen.flow_from_directory(
+    train_dir,
+    target_size=(img_width, img_height),
+    batch_size=64,  # Increase batch size if memory allows
+    class_mode='categorical'
+)
 
-# Save augmented images
-save_augmented_images(train_images, train_labels_idx, class_names)
+val_generator = val_datagen.flow_from_directory(
+    val_dir,
+    target_size=(img_width, img_height),
+    batch_size=64,
+    class_mode='categorical'
+)
 
-# One-hot encode the labels
-train_labels_cat = to_categorical(train_labels_idx, num_classes=len(class_names))
+test_generator = test_datagen.flow_from_directory(
+    test_dir,
+    target_size=(img_width, img_height),
+    batch_size=64,
+    class_mode='categorical',
+    shuffle=False
+)
 
-# Define the CNN model
-model = Sequential([
-    Conv2D(32, (3, 3), activation='relu', input_shape=(224, 224, 3)),
-    MaxPooling2D((2, 2)),
-    Conv2D(64, (3, 3), activation='relu'),
-    MaxPooling2D((2, 2)),
-    Conv2D(128, (3, 3), activation='relu'),
-    MaxPooling2D((2, 2)),
-    Flatten(),
-    Dense(128, activation='relu'),
-    Dense(len(class_names), activation='softmax')
-])
+# Load the ResNet50 model with locally downloaded weights
+local_weights_file = '/Users/riddhikakkad/Desktop/Jute_Pest_Dataset/resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5'
+base_model = ResNet50(weights=local_weights_file, include_top=False, input_shape=(img_width, img_height, 3))
 
-# Compile the model
-model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+# Add custom layers on top of ResNet50
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dense(1024, activation='relu')(x)
+predictions = Dense(17, activation='softmax', dtype='float32')(x)  # Set dtype to float32
+
+# Create the complete model
+model = Model(inputs=base_model.input, outputs=predictions)
+
+# Unfreeze some of the top layers of the base model
+for layer in base_model.layers[-10:]:
+    layer.trainable = True
+
+# Compile the model with a lower learning rate
+model.compile(optimizer=Adam(learning_rate=0.0001), loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Use a learning rate scheduler to reduce learning rate when the model plateaus
+lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=3, verbose=1)
+
+# Save the best model during training
+checkpoint = ModelCheckpoint('best_model.keras', monitor='val_loss', save_best_only=True, verbose=1)
 
 # Train the model
-model.fit(train_images, train_labels_cat, epochs=10, batch_size=32, validation_split=0.2)
+history = model.fit(
+    train_generator,
+    steps_per_epoch=train_generator.samples // train_generator.batch_size,
+    epochs=20,  # Increase the number of epochs
+    validation_data=val_generator,
+    validation_steps=val_generator.samples // val_generator.batch_size,
+    callbacks=[lr_scheduler, checkpoint]
+)
 
-# Evaluate the model
-test_images, test_labels, _ = load_and_preprocess_images(os.path.join(dataset_path, 'test'))
-test_labels_idx = np.array([label_to_index[label] for label in test_labels])
-test_labels_cat = to_categorical(test_labels_idx, num_classes=len(class_names))
-
-loss, accuracy = model.evaluate(test_images, test_labels_cat)
-print(f'Test accuracy: {accuracy:.2f}')
-
-print("Data augmentation and CNN training completed.")
+# Evaluate the model on the test set
+test_loss, test_accuracy = model.evaluate(test_generator, steps=test_generator.samples // test_generator.batch_size)
+print(f'Test accuracy: {test_accuracy:.4f}')
